@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>maze</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#0a0a0a;color:#c8c8c8;font-family:monospace;font-size:13px;line-height:1.4;}
+pre{font-family:monospace;white-space:pre;}
+#shell{max-width:680px;margin:0 auto;padding:20px 10px;}
+textarea{background:#0a0a0a;color:#c8c8c8;border:none;outline:none;font-family:monospace;font-size:13px;resize:none;width:100%;caret-color:#c8c8c8;}
+#game-wrap{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:#000;cursor:none;}
+canvas{display:block;}
+#hud{position:absolute;top:8px;left:8px;font-family:monospace;font-size:11px;color:#555;pointer-events:none;white-space:pre;line-height:1.6;}
+#msg{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-family:monospace;font-size:14px;color:#fff;pointer-events:none;text-align:center;text-shadow:0 0 12px #fff;white-space:pre;}
+#minimap{position:absolute;bottom:8px;right:8px;opacity:0.55;image-rendering:pixelated;}
+#lock-prompt{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);font-family:monospace;font-size:11px;color:#333;pointer-events:none;transition:opacity 0.3s;}
+#vr-btn{position:absolute;bottom:8px;left:8px;font-family:monospace;font-size:11px;color:#444;cursor:pointer;background:none;border:none;padding:0;}
+#vr-btn:hover{color:#aaa;}
+#dev-console{display:none;position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.88);border-top:1px solid #222;padding:6px 8px;}
+#dev-log{height:90px;overflow-y:auto;margin-bottom:4px;}
+#dev-log div{font-family:monospace;font-size:11px;padding:1px 0;color:#777;}
+#dev-log .err{color:#e44;}
+#dev-log .ok{color:#4c4;}
+#dev-log .info{color:#46c;}
+#dev-input-wrap{display:flex;align-items:center;}
+#dev-prompt{color:#333;margin-right:6px;font-family:monospace;font-size:12px;}
+#dev-input{flex:1;background:none;border:none;outline:none;font-family:monospace;font-size:12px;color:#c8c8c8;caret-color:#c8c8c8;}
+</style>
+</head>
+<body>
+
+<!-- SHELL -->
+<div id="shell">
+<pre>maze v0.2 — raycaster
+
+  # = wall   S = start   T = target   (space) = path
+
+modes (click to toggle):
+</pre>
+<pre id="mode-display"
+>[<span class="tb" data-m="lo">_</span>] lights-out  [<span class="tb" data-m="mc">_</span>] monochrome  [<span class="tb" data-m="ri">_</span>] rand-texture
+[<span class="tb" data-m="en">_</span>] entity      [<span class="tb" data-m="so">_</span>] solaris      [<span class="tb" data-m="nd">_</span>] nodepthcam
+</pre>
+<pre>
+grid:</pre>
+<textarea id="grid-in" rows="12" placeholder="##########&#10;#S       #&#10;# #### # #&#10;# #    # #&#10;# # ## # #&#10;# # #  # #&#10;#   # ## #&#10;#### #   #&#10;#    ### #&#10;#  ###  T#&#10;##########" spellcheck="false"></textarea>
+<pre id="status"></pre>
+<pre>
+&gt; <span id="start-btn" style="cursor:pointer;text-decoration:underline;">START</span>   <span id="validate-btn" style="cursor:pointer;text-decoration:underline;">VALIDATE</span>
+
+<span style="color:#444;">controls:
+  WASD / HJKL      — move &amp; turn
+  YUBN             — strafe / move diagonals
+  Shift            — sprint
+  mouse            — look (click to lock, ESC to unlock)
+  gamepad          — left stick move, right stick look, A sprint, B console
+  ~                — dev console
+  M                — minimap toggle
+  V                — enter WebXR VR
+  ESC              — unlock / exit</span>
+</pre>
+</div>
+
+<!-- GAME -->
+<div id="game-wrap">
+  <canvas id="gc"></canvas>
+  <div id="hud"></div>
+  <div id="msg"></div>
+  <canvas id="minimap"></canvas>
+  <div id="lock-prompt">click to lock mouse</div>
+  <button id="vr-btn">[ enter VR ]</button>
+  <div id="dev-console">
+    <div id="dev-log"></div>
+    <div id="dev-input-wrap">
+      <span id="dev-prompt">&gt;</span>
+      <input id="dev-input" type="text" autocomplete="off" spellcheck="false" placeholder="type help">
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ── modes ─────────────────────────────────────────────────────────
+const modes={lo:false,mc:false,ri:false,en:false,so:false,nd:false};
+document.querySelectorAll('.tb').forEach(el=>{
+  el.style.cursor='pointer';
+  el.addEventListener('click',()=>{
+    const m=el.dataset.m;modes[m]=!modes[m];el.textContent=modes[m]?'X':'_';
+  });
+});
+
+// ── grid parse + BFS validate ─────────────────────────────────────
+function parseGrid(raw){
+  const lines=raw.replace(/\r/g,'').split('\n');
+  while(lines.length&&lines[lines.length-1].trim()==='')lines.pop();
+  if(!lines.length)return{err:'empty grid'};
+  const W=Math.max(...lines.map(l=>l.length));
+  const grid=lines.map(l=>l.padEnd(W,' ').split(''));
+  const H=grid.length;
+  let S=null,T=null;
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    if(grid[y][x]==='S')S={x,y};
+    if(grid[y][x]==='T')T={x,y};
+  }
+  if(!S)return{err:'no S found'};
+  if(!T)return{err:'no T found'};
+  const vis=Array.from({length:H},()=>new Uint8Array(W));
+  const q=[S];vis[S.y][S.x]=1;let found=false;
+  while(q.length){
+    const{x,y}=q.shift();
+    if(x===T.x&&y===T.y){found=true;break;}
+    for(const[dx,dy]of[[1,0],[-1,0],[0,1],[0,-1]]){
+      const nx=x+dx,ny=y+dy;
+      if(nx>=0&&ny>=0&&nx<W&&ny<H&&!vis[ny][nx]&&grid[ny][nx]!=='#'){vis[ny][nx]=1;q.push({x:nx,y:ny});}
+    }
+  }
+  if(!found)return{err:'no path from S to T'};
+  return{grid,W,H,S,T};
+}
+
+document.getElementById('validate-btn').addEventListener('click',()=>{
+  const r=parseGrid(document.getElementById('grid-in').value);
+  document.getElementById('status').textContent=r.err?'✗ '+r.err:'✓ valid ('+r.W+'x'+r.H+')';
+});
+document.getElementById('start-btn').addEventListener('click',startGame);
+
+// ── hsl util ──────────────────────────────────────────────────────
+function hslToRgb(h,s,l){
+  if(s===0){const v=l*255|0;return[v,v,v];}
+  const h2r=(p,q,t)=>{if(t<0)t+=1;if(t>1)t-=1;if(t<1/6)return p+(q-p)*6*t;if(t<0.5)return q;if(t<2/3)return p+(q-p)*(2/3-t)*6;return p;};
+  const q=l<0.5?l*(1+s):l+s-l*s,p=2*l-q;
+  return[h2r(p,q,h+1/3)*255|0,h2r(p,q,h)*255|0,h2r(p,q,h-1/3)*255|0];
+}
+
+// ── game state ────────────────────────────────────────────────────
+let GS=null;
+
+function startGame(){
+  const raw=document.getElementById('grid-in').value||document.getElementById('grid-in').placeholder;
+  const r=parseGrid(raw);
+  if(r.err){document.getElementById('status').textContent='✗ '+r.err;return;}
+  document.getElementById('shell').style.display='none';
+  document.getElementById('game-wrap').style.display='block';
+  initGame(r);
+}
+
+function initGame({grid,W,H,S,T}){
+  const canvas=document.getElementById('gc');
+  const ctx=canvas.getContext('2d');
+  let cw=canvas.width=window.innerWidth;
+  let ch=canvas.height=window.innerHeight;
+  window.addEventListener('resize',()=>{cw=canvas.width=window.innerWidth;ch=canvas.height=window.innerHeight;});
+
+  // player
+  const pl={x:S.x+0.5,y:S.y+0.5,angle:0,fov:Math.PI/2.5,speed:0.05,turnSpeed:0.032,noclip:false,god:false};
+
+  // entity
+  let entity=null;
+  if(modes.en)entity={x:T.x+0.5,y:T.y+0.5,speed:0.02,stunTimer:0};
+
+  // procedural texture
+  const texSize=64;
+  const texCv=document.createElement('canvas');texCv.width=texCv.height=texSize;
+  const txc=texCv.getContext('2d');
+  if(modes.ri){
+    for(let y=0;y<texSize;y++){
+      for(let x=0;x<texSize;x++){
+        const bH=8,bW=16,row=y/bH|0,ox2=(row%2)*8,bx=(((x+ox2)/bW)|0);
+        const mX=(x+ox2)%bW<=1,mY=y%bH===0||y%bH===7;
+        const n=Math.abs(Math.sin(x*127.1+y*311.7)*43758.5453%1);
+        const base=mX||mY?50:125+n*30;
+        txc.fillStyle=`rgb(${base+(bx*17)%22|0},${base*0.52|0},${base*0.42|0})`;
+        txc.fillRect(x,y,1,1);
+      }
+    }
+  }
+  const texData=modes.ri?txc.getImageData(0,0,texSize,texSize):null;
+
+  // state
+  let solarisT=0,showMinimap=true,won=false,entityCaught=false;
+  let consoleOpen=false,locked=false,vrSession=null;
+  const cmdHistory=[];let cmdHistIdx=-1;
+
+  // ── POINTER LOCK (FPS standard) ───────────────────────────────
+  const lockPrompt=document.getElementById('lock-prompt');
+
+  function requestLock(){
+    if(!consoleOpen&&!won&&!entityCaught)canvas.requestPointerLock();
+  }
+  canvas.addEventListener('click',requestLock);
+
+  document.addEventListener('pointerlockchange',()=>{
+    locked=document.pointerLockElement===canvas;
+    lockPrompt.style.opacity=locked?'0':'1';
+  });
+
+  document.addEventListener('mousemove',e=>{
+    if(locked&&!consoleOpen)pl.angle+=e.movementX*0.0022;
+  });
+
+  // ── KEYBOARD ──────────────────────────────────────────────────
+  const keys={};
+  document.addEventListener('keydown',e=>{
+    if(e.key==='`'||e.key==='~'){toggleConsole();return;}
+    if(consoleOpen)return;
+    const k=e.key.toLowerCase();
+    keys[k]=true;
+    if(e.key==='Escape'){
+      if(locked){document.exitPointerLock();return;}
+      exitGame();return;
+    }
+    if(k==='m')showMinimap=!showMinimap;
+    if(k==='v')enterVR();
+    e.preventDefault();
+  });
+  document.addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false;});
+
+  // ── DEV CONSOLE ───────────────────────────────────────────────
+  const devEl=document.getElementById('dev-console');
+  const devLog=document.getElementById('dev-log');
+  const devInput=document.getElementById('dev-input');
+
+  function toggleConsole(){
+    consoleOpen=!consoleOpen;
+    devEl.style.display=consoleOpen?'block':'none';
+    if(consoleOpen){
+      if(locked)document.exitPointerLock();
+      devInput.focus();
+      devLog.scrollTop=devLog.scrollHeight;
+    }
+  }
+
+  function clog(txt,cls=''){
+    const d=document.createElement('div');
+    if(cls)d.className=cls;d.textContent=txt;
+    devLog.appendChild(d);devLog.scrollTop=devLog.scrollHeight;
+  }
+  clog('maze dev console — type help','info');
+
+  devInput.addEventListener('keydown',e=>{
+    if(e.key==='Enter'){
+      const cmd=devInput.value.trim();
+      if(cmd){cmdHistory.unshift(cmd);cmdHistIdx=-1;clog('> '+cmd);}
+      devInput.value='';if(cmd)runCmd(cmd);
+    }
+    if(e.key==='ArrowUp'){cmdHistIdx=Math.min(cmdHistIdx+1,cmdHistory.length-1);devInput.value=cmdHistory[cmdHistIdx]||'';e.preventDefault();}
+    if(e.key==='ArrowDown'){cmdHistIdx=Math.max(cmdHistIdx-1,-1);devInput.value=cmdHistIdx<0?'':cmdHistory[cmdHistIdx];e.preventDefault();}
+    if(e.key==='Escape')toggleConsole();
+    e.stopPropagation();
+  });
+
+  function runCmd(raw){
+    const p=raw.trim().split(/\s+/),cmd=p[0].toLowerCase(),a=p.slice(1);
+    switch(cmd){
+      case'help':
+        ['tp <x> <y>      teleport to grid cell',
+         'pos             print position',
+         'speed <n>       move speed (default 0.05)',
+         'noclip          toggle noclip',
+         'god             toggle god mode (entity ignores you)',
+         'mode <id>       toggle mode: lo mc ri en so nd',
+         'fov <deg>       field of view in degrees',
+         'entity reset    respawn entity at T',
+         'win             trigger win condition',
+         'clear           clear log'
+        ].forEach(l=>clog('  '+l));break;
+      case'tp':
+        if(a.length<2){clog('tp <x> <y>','err');break;}
+        const tx=parseFloat(a[0]),ty=parseFloat(a[1]);
+        if(isNaN(tx)||isNaN(ty)){clog('bad numbers','err');break;}
+        pl.x=tx+0.5;pl.y=ty+0.5;clog(`tp -> ${tx},${ty}`,'ok');break;
+      case'pos':
+        clog(`${pl.x.toFixed(3)}, ${pl.y.toFixed(3)}  angle:${(pl.angle*180/Math.PI).toFixed(1)}`,'ok');break;
+      case'speed':
+        pl.speed=parseFloat(a[0])||0.05;clog('speed: '+pl.speed,'ok');break;
+      case'noclip':
+        pl.noclip=!pl.noclip;clog('noclip: '+(pl.noclip?'on':'off'),'ok');break;
+      case'god':
+        pl.god=!pl.god;clog('god: '+(pl.god?'on':'off'),'ok');break;
+      case'mode':
+        if(!a[0]||!(a[0] in modes)){clog('valid: lo mc ri en so nd','err');break;}
+        modes[a[0]]=!modes[a[0]];
+        if(a[0]==='en'&&modes.en&&!entity)entity={x:T.x+0.5,y:T.y+0.5,speed:0.02,stunTimer:0};
+        clog(`mode ${a[0]}: ${modes[a[0]]?'on':'off'}`,'ok');break;
+      case'fov':
+        pl.fov=(parseFloat(a[0])||72)*Math.PI/180;clog('fov: '+a[0]+'°','ok');break;
+      case'entity':
+        if(a[0]==='reset'){entity={x:T.x+0.5,y:T.y+0.5,speed:0.02,stunTimer:0};entityCaught=false;clog('entity reset','ok');}break;
+      case'win':
+        won=true;clog('win','ok');break;
+      case'clear':
+        devLog.innerHTML='';break;
+      default:
+        clog('unknown: '+cmd,'err');
+    }
+  }
+
+  // ── GAMEPAD ───────────────────────────────────────────────────
+  const padState={bPrev:{}};
+  function pollGamepad(){
+    const pads=navigator.getGamepads?navigator.getGamepads():[];
+    for(const pad of pads){
+      if(!pad||!pad.connected)continue;
+      const dz=0.15;
+      const lx=Math.abs(pad.axes[0])>dz?pad.axes[0]:0;
+      const ly=Math.abs(pad.axes[1])>dz?pad.axes[1]:0;
+      const rx=Math.abs(pad.axes[2])>dz?pad.axes[2]:0;
+      const sprint=pad.buttons[0]?.pressed?2.2:1; // A = sprint
+      if((lx||ly)&&!won&&!entityCaught&&!consoleOpen){
+        const spd=pl.speed*sprint;
+        const fw=-ly,st=lx;
+        const nx=pl.x+Math.cos(pl.angle)*fw*spd+Math.cos(pl.angle+Math.PI/2)*st*spd;
+        const ny=pl.y+Math.sin(pl.angle)*fw*spd+Math.sin(pl.angle+Math.PI/2)*st*spd;
+        if(pl.noclip||!isWall(nx,pl.y))pl.x=nx;
+        if(pl.noclip||!isWall(pl.x,ny))pl.y=ny;
+      }
+      if(rx&&!consoleOpen)pl.angle+=rx*0.038;
+      // B button = console toggle
+      const bNow=pad.buttons[1]?.pressed;
+      if(bNow&&!padState.bPrev[pad.index])toggleConsole();
+      padState.bPrev[pad.index]=bNow;
+      break;
+    }
+  }
+
+  // ── WEBXR ─────────────────────────────────────────────────────
+  const vrBtn=document.getElementById('vr-btn');
+  (async()=>{
+    if(!navigator.xr){vrBtn.style.display='none';return;}
+    const sup=await navigator.xr.isSessionSupported('immersive-vr').catch(()=>false);
+    if(!sup){vrBtn.textContent='[ VR unavailable ]';vrBtn.style.color='#333';vrBtn.disabled=true;}
+  })();
+
+  async function enterVR(){
+    if(!navigator.xr)return;
+    if(vrSession){await vrSession.end();return;}
+    try{
+      vrSession=await navigator.xr.requestSession('immersive-vr',{requiredFeatures:['local']});
+      vrBtn.textContent='[ exit VR ]';
+      vrSession.addEventListener('end',()=>{vrSession=null;vrBtn.textContent='[ enter VR ]';});
+      // Use canvas 2D for stereo rendering (split-screen per eye)
+      vrSession.requestAnimationFrame(vrFrame);
+    }catch(e){
+      clog('VR: '+e.message,'err');vrSession=null;
+    }
+  }
+
+  function vrFrame(t,frame){
+    if(!vrSession)return;
+    const refSpace=vrSession.requestReferenceSpace?null:null; // we use app-level tracking
+    vrSession.requestAnimationFrame(vrFrame);
+
+    // Render two eyes side by side on the 2D canvas
+    // XR pose orientation -> extract yaw for look direction
+    try{
+      const pose=frame.getViewerPose&&frame.getViewerPose(vrSession._refSpace);
+      if(pose){
+        for(let ei=0;ei<Math.min(pose.views.length,2);ei++){
+          const v=pose.views[ei];
+          const q=v.transform.orientation;
+          const yaw=Math.atan2(2*(q.w*q.y+q.x*q.z),1-2*(q.y*q.y+q.z*q.z));
+          pl.angle=yaw;
+        }
+      }
+    }catch(e){}
+
+    const eyeW=cw/2;
+    ctx.fillStyle='#000';ctx.fillRect(0,0,cw,ch);
+    pl.angle-=0.032; renderScene(0,0,eyeW,ch);    // left eye
+    pl.angle+=0.064; renderScene(eyeW,0,eyeW,ch); // right eye (slight toe-in)
+    pl.angle-=0.032;
+  }
+
+  vrBtn.addEventListener('click',enterVR);
+
+  // ── WALL TEST ─────────────────────────────────────────────────
+  function isWall(x,y){
+    const ix=x|0,iy=y|0;
+    if(ix<0||iy<0||ix>=W||iy>=H)return true;
+    return grid[iy][ix]==='#';
+  }
+
+  // ── DDA ───────────────────────────────────────────────────────
+  function castRay(angle){
+    const cosA=Math.cos(angle),sinA=Math.sin(angle);
+    let mx=pl.x|0,my=pl.y|0;
+    const dDX=Math.abs(1/(cosA||1e-18)),dDY=Math.abs(1/(sinA||1e-18));
+    let stepX,stepY,sdX,sdY;
+    if(cosA<0){stepX=-1;sdX=(pl.x-mx)*dDX;}else{stepX=1;sdX=(mx+1-pl.x)*dDX;}
+    if(sinA<0){stepY=-1;sdY=(pl.y-my)*dDY;}else{stepY=1;sdY=(my+1-pl.y)*dDY;}
+    let side=0,dist=0,wX=0;
+    for(let i=0;i<(W+H)*2;i++){
+      if(sdX<sdY){sdX+=dDX;mx+=stepX;side=0;}else{sdY+=dDY;my+=stepY;side=1;}
+      if(mx>=0&&my>=0&&mx<W&&my<H&&grid[my][mx]==='#'){
+        dist=side===0?sdX-dDX:sdY-dDY;
+        wX=side===0?pl.y+dist*sinA:pl.x+dist*cosA;
+        wX-=Math.floor(wX);
+        return{dist,side,wX};
+      }
+    }
+    return{dist:999,side:0,wX:0};
+  }
+
+  // ── ENTITY AI ─────────────────────────────────────────────────
+  function tickEntity(){
+    if(!entity){return;}
+    if(entity.stunTimer>0){entity.stunTimer--;return;}
+    const ex=entity.x|0,ey=entity.y|0,px=pl.x|0,py=pl.y|0;
+    if(ex===px&&ey===py)return;
+    const vis=Array.from({length:H},()=>new Uint8Array(W));
+    const q=[{x:ex,y:ey,fx:-1,fy:-1}];vis[ey][ex]=1;
+    let ns=null;
+    outer:while(q.length){
+      const cur=q.shift();
+      for(const[dx,dy]of[[1,0],[-1,0],[0,1],[0,-1]]){
+        const nx=cur.x+dx,ny=cur.y+dy;
+        if(nx<0||ny<0||nx>=W||ny>=H||vis[ny][nx]||grid[ny][nx]==='#')continue;
+        vis[ny][nx]=1;
+        const first=cur.fx<0;
+        const rec={x:nx,y:ny,fx:first?nx:cur.fx,fy:first?ny:cur.fy};
+        if(nx===px&&ny===py){ns={x:rec.fx,y:rec.fy};break outer;}
+        q.push(rec);
+      }
+    }
+    if(ns){
+      const tx2=ns.x+0.5,ty2=ns.y+0.5;
+      const ddx=tx2-entity.x,ddy=ty2-entity.y,dd=Math.sqrt(ddx*ddx+ddy*ddy)||1;
+      entity.x+=ddx/dd*entity.speed;entity.y+=ddy/dd*entity.speed;
+    }
+    if(!pl.god){
+      const cdx=entity.x-pl.x,cdy=entity.y-pl.y;
+      if(cdx*cdx+cdy*cdy<0.36)entityCaught=true;
+    }
+  }
+
+  // ── PLAYER MOVEMENT ───────────────────────────────────────────
+  function tickPlayer(){
+    if(won||entityCaught)return;
+    const spd=pl.speed*(keys['shift']?2.2:1);
+    let dx=0,dy=0,da=0;
+    if(keys['w']||keys['arrowup']||keys['k']||keys['u']){dx+=Math.cos(pl.angle)*spd;dy+=Math.sin(pl.angle)*spd;}
+    if(keys['s']||keys['arrowdown']||keys['j']||keys['b']){dx-=Math.cos(pl.angle)*spd;dy-=Math.sin(pl.angle)*spd;}
+    if(keys['a']||keys['arrowleft']||keys['h'])da-=pl.turnSpeed;
+    if(keys['d']||keys['arrowright']||keys['l'])da+=pl.turnSpeed;
+    if(keys['y']){dx+=Math.cos(pl.angle-Math.PI/2)*spd;dy+=Math.sin(pl.angle-Math.PI/2)*spd;}
+    if(keys['n']){dx+=Math.cos(pl.angle+Math.PI/2)*spd;dy+=Math.sin(pl.angle+Math.PI/2)*spd;}
+    pl.angle+=da;
+    if(pl.noclip){pl.x+=dx;pl.y+=dy;}
+    else{if(!isWall(pl.x+dx,pl.y))pl.x+=dx;if(!isWall(pl.x,pl.y+dy))pl.y+=dy;}
+    if(!pl.noclip&&(pl.x|0)===T.x&&(pl.y|0)===T.y)won=true;
+  }
+
+  // ── RENDER ────────────────────────────────────────────────────
+  function renderScene(offX,offY,rw,rh){
+    const hfov=pl.fov/2;
+
+    // sky / floor
+    if(!modes.nd){
+      const cg=ctx.createLinearGradient(0,offY,0,offY+rh/2);
+      if(modes.so){const h2=(solarisT*22+180)%360;cg.addColorStop(0,`hsl(${h2},75%,4%)`);cg.addColorStop(1,`hsl(${(h2+55)%360},75%,12%)`);}
+      else if(modes.mc){cg.addColorStop(0,'#000');cg.addColorStop(1,'#080808');}
+      else{cg.addColorStop(0,'#000');cg.addColorStop(1,'#060604');}
+      ctx.fillStyle=cg;ctx.fillRect(offX,offY,rw,rh/2);
+
+      const fg=ctx.createLinearGradient(0,offY+rh/2,0,offY+rh);
+      if(modes.so){const h1=(solarisT*30)%360;fg.addColorStop(0,`hsl(${h1},55%,9%)`);fg.addColorStop(1,`hsl(${(h1+45)%360},55%,18%)`);}
+      else if(modes.mc){fg.addColorStop(0,'#0f0f0f');fg.addColorStop(1,'#1a1a1a');}
+      else{fg.addColorStop(0,'#0d0d0b');fg.addColorStop(1,'#1a1810');}
+      ctx.fillStyle=fg;ctx.fillRect(offX,offY+rh/2,rw,rh/2);
+    }else{
+      ctx.fillStyle='#000';ctx.fillRect(offX,offY,rw,rh);
+    }
+
+    // walls
+    for(let i=0;i<rw;i++){
+      const ray=pl.angle-hfov+(i/rw)*pl.fov;
+      const{dist,side,wX}=castRay(ray);
+      const corr=dist*Math.cos(ray-pl.angle)||0.001;
+      const wallH=modes.nd?rh*0.8:Math.min(rh,rh/corr);
+      const top=offY+(rh-wallH)/2;
+
+      let alpha=1;
+      if(modes.lo){alpha=Math.max(0,1-corr/2.6);if(alpha<=0)continue;}
+
+      const shade=side===1?0.52:1;
+      const fog=modes.nd?1:Math.max(0.03,1-corr/Math.max(W,H)*0.9);
+
+      if(modes.ri&&texData){
+        const txi=Math.floor(wX*texSize);
+        const td=texData.data;
+        let tr=0,tg2=0,tb=0;
+        for(let ty=0;ty<texSize;ty+=4){const idx=(ty*texSize+txi)*4;tr+=td[idx];tg2+=td[idx+1];tb+=td[idx+2];}
+        const sp=texSize/4;
+        let r2=tr/sp*shade*fog|0,g2=tg2/sp*shade*fog|0,b2=tb/sp*shade*fog|0;
+        if(modes.mc){const lm=(r2+g2+b2)/3|0;r2=g2=b2=lm;}
+        if(modes.so){const hs=(solarisT*60+i*0.5)%360;const hc=hslToRgb(hs/360,0.7,Math.min(0.6,(r2/255)*0.4+0.1));r2=hc[0];g2=hc[1];b2=hc[2];}
+        ctx.globalAlpha=alpha;ctx.fillStyle=`rgb(${r2},${g2},${b2})`;
+      }else if(modes.so){
+        const hue=((solarisT*85+i*0.28+dist*18)%360);
+        ctx.globalAlpha=alpha;ctx.fillStyle=`hsl(${hue},${62+Math.sin(solarisT+dist)*18}%,${Math.min(65,fog*55*shade)}%)`;
+      }else if(modes.mc){
+        const v=Math.min(255,fog*shade*215)|0;
+        ctx.globalAlpha=alpha;ctx.fillStyle=`rgb(${v},${v},${v})`;
+      }else{
+        ctx.globalAlpha=alpha;ctx.fillStyle=`rgb(${fog*shade*108|0},${fog*shade*80|0},${fog*shade*55|0})`;
+      }
+      ctx.fillRect(offX+i,top,1,wallH);
+      ctx.globalAlpha=1;
+    }
+
+    // entity billboard
+    if(entity&&!entityCaught){
+      const edx=entity.x-pl.x,edy=entity.y-pl.y;
+      const eDist=Math.sqrt(edx*edx+edy*edy)||0.01;
+      let eA=Math.atan2(edy,edx)-pl.angle;
+      while(eA>Math.PI)eA-=Math.PI*2;while(eA<-Math.PI)eA+=Math.PI*2;
+      if(Math.abs(eA)<hfov+0.3){
+        const scX=offX+rw/2+Math.tan(eA)*(rw/2)/Math.tan(hfov);
+        const sH=modes.nd?rh*0.78:Math.min(rh*1.5,rh/eDist);
+        const sTop=offY+(rh-sH)/2;const sW=sH*0.42;
+        const ea=modes.lo?Math.max(0,1-eDist/2.6):0.9;
+        ctx.globalAlpha=ea;
+        if(modes.so)ctx.fillStyle=`hsl(${(solarisT*115)%360},100%,55%)`;
+        else if(modes.mc)ctx.fillStyle='#ccc';
+        else ctx.fillStyle='#bb1f1f';
+        ctx.fillRect(scX-sW/2,sTop,sW,sH);
+        ctx.fillStyle=modes.so?`hsl(${(solarisT*115+180)%360},100%,70%)`:'#000';
+        ctx.fillRect(scX-sW*0.25,sTop+sH*0.1,sW*0.14,sH*0.12);
+        ctx.fillRect(scX+sW*0.1, sTop+sH*0.1,sW*0.14,sH*0.12);
+        ctx.globalAlpha=1;
+      }
+    }
+
+    // lights-out vignette
+    if(modes.lo){
+      const vg=ctx.createRadialGradient(offX+rw/2,offY+rh/2,0,offX+rw/2,offY+rh/2,Math.max(rw,rh)*0.68);
+      vg.addColorStop(0,'rgba(0,0,0,0)');vg.addColorStop(0.32,'rgba(0,0,0,0.2)');vg.addColorStop(1,'rgba(0,0,0,1)');
+      ctx.fillStyle=vg;ctx.fillRect(offX,offY,rw,rh);
+    }
+
+    // crosshair
+    const cx=offX+rw/2,cy=offY+rh/2;
+    ctx.strokeStyle='rgba(255,255,255,0.3)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(cx-7,cy);ctx.lineTo(cx+7,cy);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(cx,cy-7);ctx.lineTo(cx,cy+7);ctx.stroke();
+  }
+
+  // ── MINIMAP ───────────────────────────────────────────────────
+  function drawMinimap(){
+    const mm=document.getElementById('minimap');
+    const cs=Math.max(3,Math.min(8,((Math.min(cw,ch)*0.25)/Math.max(W,H))|0));
+    mm.width=W*cs;mm.height=H*cs;
+    const mx=mm.getContext('2d');
+    for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+      mx.fillStyle=grid[y][x]==='#'?'#353535':grid[y][x]==='S'?'#246':grid[y][x]==='T'?'#622':'#111';
+      mx.fillRect(x*cs,y*cs,cs,cs);
+    }
+    mx.fillStyle='#eee';mx.fillRect(pl.x*cs-1.5,pl.y*cs-1.5,3,3);
+    mx.strokeStyle='rgba(255,255,255,0.2)';mx.beginPath();
+    mx.moveTo(pl.x*cs,pl.y*cs);
+    mx.lineTo((pl.x+Math.cos(pl.angle-pl.fov/2)*2.5)*cs,(pl.y+Math.sin(pl.angle-pl.fov/2)*2.5)*cs);
+    mx.moveTo(pl.x*cs,pl.y*cs);
+    mx.lineTo((pl.x+Math.cos(pl.angle+pl.fov/2)*2.5)*cs,(pl.y+Math.sin(pl.angle+pl.fov/2)*2.5)*cs);
+    mx.stroke();
+    if(entity){mx.fillStyle='#e33';mx.fillRect(entity.x*cs-2,entity.y*cs-2,4,4);}
+  }
+
+  // ── LOOP ──────────────────────────────────────────────────────
+  let last=0;
+  function loop(ts){
+    if(!GS)return;
+    const dt=Math.min(ts-last,80);last=ts;
+    solarisT+=dt*0.001;
+    pollGamepad();
+    tickPlayer();
+    tickEntity();
+
+    if(vrSession){GS.raf=requestAnimationFrame(loop);return;}
+
+    ctx.fillStyle='#000';ctx.fillRect(0,0,cw,ch);
+    renderScene(0,0,cw,ch);
+
+    // HUD
+    const mStr=Object.entries(modes).filter(([,v])=>v).map(([k])=>k).join(' ');
+    const fl=(pl.noclip?'[nc]':'')+(pl.god?' [god]':'');
+    document.getElementById('hud').textContent=
+      `${pl.x.toFixed(1)},${pl.y.toFixed(1)} ${(((pl.angle*180/Math.PI)%360+360)%360)|0}°`+
+      (mStr?'\n'+mStr:'')+
+      (fl?'\n'+fl:'')+
+      '\n[~] console  [M] map  [V] VR';
+
+    const msgEl=document.getElementById('msg');
+    if(won)msgEl.textContent='YOU REACHED\nTHE TARGET\n\nESC to exit';
+    else if(entityCaught)msgEl.textContent='THE ENTITY\nGOT YOU\n\nESC to exit';
+    else msgEl.textContent='';
+
+    if(showMinimap)drawMinimap();
+    else{const mm=document.getElementById('minimap');mm.width=0;}
+
+    GS.raf=requestAnimationFrame(loop);
+  }
+
+  GS={raf:null};
+  GS.raf=requestAnimationFrame(loop);
+}
+
+function exitGame(){
+  if(GS&&GS.raf)cancelAnimationFrame(GS.raf);
+  GS=null;
+  document.getElementById('game-wrap').style.display='none';
+  document.getElementById('shell').style.display='block';
+  document.getElementById('dev-console').style.display='none';
+  document.exitPointerLock&&document.exitPointerLock();
+}
+</script>
+</body>
+</html>
